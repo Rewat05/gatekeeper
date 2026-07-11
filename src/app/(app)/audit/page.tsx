@@ -40,6 +40,9 @@ const ACTIONS = [
   "JOIN_REQUEST_DENIED",
   "MEMBER_JOINED",
   "MEMBER_UPDATED",
+  "REVIEW_CAMPAIGN_STARTED",
+  "ACCESS_REVIEW_CERTIFIED",
+  "ACCESS_REVIEW_REVOKED",
 ] as const
 
 const SORTABLE_COLUMNS = ["created_at", "action"] as const

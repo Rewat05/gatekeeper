@@ -199,6 +199,77 @@ create table public.access_reviews (
   created_at    timestamptz not null default now()
 );
 
+-- Only one recertification cycle may be open per org at a time — avoids
+-- confusing overlapping campaigns fanning out duplicate reviews for the
+-- same grants.
+create unique index review_campaigns_one_active_per_org
+  on public.review_campaigns (org_id)
+  where status = 'Active';
+
+-- Starts a campaign and fans out one review per currently-active grant in
+-- one atomic call. Each grant's reviewer is its grantee's department
+-- manager, or the org owner if the grantee has no department/manager.
+create or replace function public.start_review_campaign(
+  p_org_id uuid,
+  p_triggered_by text,
+  p_days_open int
+) returns uuid
+language plpgsql as $$
+declare
+  v_campaign_id uuid;
+  v_owner_id text;
+begin
+  select owner_id into v_owner_id from public.organizations where id = p_org_id;
+
+  insert into public.review_campaigns (org_id, triggered_by, status, closes_at)
+  values (p_org_id, p_triggered_by, 'Active', now() + (p_days_open || ' days')::interval)
+  returning id into v_campaign_id;
+
+  insert into public.access_reviews (org_id, campaign_id, reviewer_id, grant_id)
+  select
+    p_org_id,
+    v_campaign_id,
+    coalesce(d.manager_id, v_owner_id),
+    ag.id
+  from public.access_grants ag
+  join public.org_members om
+    on om.org_id = ag.org_id and om.user_id = ag.user_id and om.status = 'Active'
+  left join public.departments d on d.id = om.department_id
+  where ag.org_id = p_org_id and ag.status = 'Active';
+
+  return v_campaign_id;
+end;
+$$;
+
+-- Records a reviewer's decision and, if revoked, revokes the underlying
+-- grant in the same atomic call — a revoke decision can never succeed
+-- while failing to actually revoke access.
+create or replace function public.decide_access_review(
+  p_review_id uuid,
+  p_reviewer_id text,
+  p_decision public.review_decision
+) returns void
+language plpgsql as $$
+declare
+  v_grant_id uuid;
+  v_updated int;
+begin
+  update public.access_reviews
+  set decision = p_decision, reviewed_at = now()
+  where id = p_review_id and reviewer_id = p_reviewer_id and decision is null
+  returning grant_id into v_grant_id;
+
+  get diagnostics v_updated = row_count;
+  if v_updated = 0 then
+    raise exception 'NOT_FOUND_OR_ALREADY_REVIEWED';
+  end if;
+
+  if p_decision = 'Revoked' then
+    update public.access_grants set status = 'Revoked' where id = v_grant_id;
+  end if;
+end;
+$$;
+
 -- ── Audit Log (append-only) ───────────────────────────────────────────────
 
 create table public.audit_log (
@@ -226,6 +297,96 @@ $$;
 create trigger on_org_created
   after insert on public.organizations
   for each row execute procedure public.create_default_department();
+
+-- ── Atomic multi-step writes ──────────────────────────────────────────────
+-- The app talks to Postgres via the Supabase REST client, where each
+-- .from(table).insert()/.update() call is its own independent HTTP request —
+-- there's no way to wrap two of them in one client-side transaction. These
+-- functions push the multi-step logic into Postgres itself: a function body
+-- runs as one implicit transaction, so if any step throws, everything
+-- before it in the same call is rolled back automatically, no manual
+-- compensating-delete code required.
+
+create or replace function public.create_org_with_owner(
+  p_name text,
+  p_domain text,
+  p_org_code text,
+  p_owner_id text
+) returns uuid
+language plpgsql as $$
+declare
+  v_org_id uuid;
+begin
+  begin
+    insert into public.organizations (name, domain, org_code, owner_id)
+    values (p_name, p_domain, p_org_code, p_owner_id)
+    returning id into v_org_id;
+  exception when unique_violation then
+    raise exception 'DOMAIN_TAKEN';
+  end;
+
+  begin
+    insert into public.org_members (org_id, user_id, role, status)
+    values (v_org_id, p_owner_id, 'Owner', 'Active');
+  exception when unique_violation then
+    raise exception 'ALREADY_MEMBER';
+  end;
+
+  return v_org_id;
+end;
+$$;
+
+create or replace function public.create_department_with_manager(
+  p_org_id uuid,
+  p_name text,
+  p_description text,
+  p_manager_user_id text,   -- departments.manager_id (better-auth user id), or null
+  p_manager_member_id uuid  -- org_members.id to move into the new department, or null
+) returns uuid
+language plpgsql as $$
+declare
+  v_dept_id uuid;
+begin
+  insert into public.departments (org_id, name, description, manager_id)
+  values (p_org_id, p_name, p_description, p_manager_user_id)
+  returning id into v_dept_id;
+
+  if p_manager_member_id is not null then
+    update public.org_members set department_id = v_dept_id where id = p_manager_member_id;
+  end if;
+
+  return v_dept_id;
+end;
+$$;
+
+-- Each p_update_* flag distinguishes "field omitted from the PATCH body"
+-- from "field explicitly provided" (manager_id can legitimately be set to
+-- null to clear it), mirroring the partial-update semantics the route
+-- already validates with zod before calling this.
+create or replace function public.update_department_with_manager(
+  p_dept_id uuid,
+  p_update_name boolean, p_name text,
+  p_update_description boolean, p_description text,
+  p_update_manager_id boolean, p_manager_user_id text,
+  p_manager_member_id uuid  -- org_members.id to move into this department, or null if no move needed
+) returns void
+language plpgsql as $$
+begin
+  if p_update_name then
+    update public.departments set name = p_name where id = p_dept_id;
+  end if;
+  if p_update_description then
+    update public.departments set description = p_description where id = p_dept_id;
+  end if;
+  if p_update_manager_id then
+    update public.departments set manager_id = p_manager_user_id where id = p_dept_id;
+  end if;
+
+  if p_manager_member_id is not null then
+    update public.org_members set department_id = p_dept_id where id = p_manager_member_id;
+  end if;
+end;
+$$;
 
 -- ============================================================
 -- RLS Policies
@@ -405,6 +566,28 @@ create policy "admins and managers see all access requests"
   using (
     org_id = public.current_org_id(auth.uid()::text) and
     public.current_role(auth.uid()::text) in ('Owner', 'Admin', 'Manager')
+  );
+
+-- ── review_campaigns ─────────────────────────────────────────────────────
+
+create policy "admins see campaigns in their org"
+  on public.review_campaigns for select
+  using (
+    org_id = public.current_org_id(auth.uid()::text) and
+    public.current_role(auth.uid()::text) in ('Owner', 'Admin')
+  );
+
+-- ── access_reviews ───────────────────────────────────────────────────────
+
+create policy "reviewer sees own assigned reviews"
+  on public.access_reviews for select
+  using (reviewer_id = auth.uid()::text);
+
+create policy "admins see all reviews in their org"
+  on public.access_reviews for select
+  using (
+    org_id = public.current_org_id(auth.uid()::text) and
+    public.current_role(auth.uid()::text) in ('Owner', 'Admin')
   );
 
 -- ============================================================

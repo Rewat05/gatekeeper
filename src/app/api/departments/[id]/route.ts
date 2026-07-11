@@ -63,13 +63,36 @@ export async function PATCH(
     if (managerChanged) manager = mgr as { id: string; department_id: string | null; role: string }
   }
 
-  const update: Record<string, unknown> = {}
-  if (parsed.data.name !== undefined) update.name = parsed.data.name
-  if (parsed.data.description !== undefined) update.description = parsed.data.description
-  if (parsed.data.managerId !== undefined) update.manager_id = parsed.data.managerId
+  const updateName = parsed.data.name !== undefined
+  const updateDescription = parsed.data.description !== undefined
+  const updateManagerId = parsed.data.managerId !== undefined
 
-  const { error } = await supabase.from("departments").update(update).eq("id", id)
+  // Owners and Admins never belong to a department, even as manager
+  const moveManager = Boolean(
+    manager && manager.role !== "Owner" && manager.role !== "Admin" && manager.department_id !== id
+  )
+
+  // The department fields and the manager's department move happen
+  // atomically in one Postgres function call — if the move fails, the
+  // department update rolls back too, instead of a partial write with an
+  // audit entry claiming a move that never actually happened.
+  const { error } = await supabase.rpc("update_department_with_manager", {
+    p_dept_id: id,
+    p_update_name: updateName,
+    p_name: parsed.data.name ?? null,
+    p_update_description: updateDescription,
+    p_description: parsed.data.description ?? null,
+    p_update_manager_id: updateManagerId,
+    p_manager_user_id: parsed.data.managerId ?? null,
+    p_manager_member_id: moveManager ? (manager as NonNullable<typeof manager>).id : null,
+  })
+
   if (error) return NextResponse.json({ error: "Update failed." }, { status: 500 })
+
+  const changedKeys: string[] = []
+  if (updateName) changedKeys.push("name")
+  if (updateDescription) changedKeys.push("description")
+  if (updateManagerId) changedKeys.push("manager_id")
 
   await logAudit({
     orgId: caller.org_id as string,
@@ -77,21 +100,20 @@ export async function PATCH(
     action: "DEPARTMENT_UPDATED",
     targetType: "department",
     targetId: id,
-    metadata: { changes: Object.keys(update) },
+    metadata: { changes: changedKeys },
   })
 
-  // Owners and Admins never belong to a department, even as manager
-  if (manager && manager.role !== "Owner" && manager.role !== "Admin" && manager.department_id !== id) {
-    await supabase.from("org_members").update({ department_id: id }).eq("id", manager.id)
+  if (moveManager) {
+    const mgr = manager as NonNullable<typeof manager>
     await logAudit({
       orgId: caller.org_id as string,
       actorId: session.user.id,
       action: "MEMBER_UPDATED",
       targetType: "org_member",
-      targetId: manager.id,
+      targetId: mgr.id,
       metadata: {
         targetUserId: parsed.data.managerId,
-        changes: { department: { from: manager.department_id, to: id } },
+        changes: { department: { from: mgr.department_id, to: id } },
       },
     })
   }

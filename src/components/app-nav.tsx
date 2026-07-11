@@ -12,6 +12,7 @@ import {
   Settings,
   UserPlus,
   IdCard,
+  ShieldCheck,
 } from "lucide-react"
 import {
   SidebarMenu,
@@ -28,6 +29,7 @@ const NAV_ITEMS = [
   { href: "/access-profiles",  label: "Access Profiles",  icon: IdCard,          roles: ["Owner", "Admin"] as Role[] },
   { href: "/file-stores",      label: "File Stores",      icon: Database,        roles: null },
   { href: "/access-requests",  label: "Access Requests",  icon: ClipboardList,   roles: null },
+  { href: "/access-reviews",   label: "Access Reviews",   icon: ShieldCheck,     roles: null },
   { href: "/join-requests",    label: "Join Requests",    icon: UserPlus,        roles: ["Owner", "Admin"] as Role[] },
   { href: "/audit",            label: "Audit Log",        icon: ScrollText,      roles: ["Owner", "Admin"] as Role[] },
   { href: "/settings",         label: "Settings",         icon: Settings,        roles: ["Owner"] as Role[] },

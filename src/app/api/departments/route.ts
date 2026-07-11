@@ -48,41 +48,43 @@ export async function POST(request: NextRequest) {
     manager = mgr as { id: string; department_id: string | null; role: string }
   }
 
-  const { data, error } = await supabase
-    .from("departments")
-    .insert({
-      org_id: caller.org_id,
-      name: parsed.data.name,
-      description: parsed.data.description ?? null,
-      manager_id: parsed.data.managerId ?? null,
-    })
-    .select("id")
-    .single()
+  // Owners and Admins never belong to a department, even as manager
+  const moveManager = Boolean(manager && manager.role !== "Owner" && manager.role !== "Admin")
+
+  // Creating the department and moving the manager into it happen
+  // atomically in one Postgres function call — if the update fails, the
+  // department insert rolls back too, instead of leaving a department
+  // whose audit trail claims a manager move that never actually happened.
+  const { data: deptId, error } = await supabase.rpc("create_department_with_manager", {
+    p_org_id: caller.org_id,
+    p_name: parsed.data.name,
+    p_description: parsed.data.description ?? null,
+    p_manager_user_id: parsed.data.managerId ?? null,
+    p_manager_member_id: moveManager ? (manager as NonNullable<typeof manager>).id : null,
+  })
 
   if (error) return NextResponse.json({ error: "Failed to create department." }, { status: 500 })
 
-  const deptId = (data as { id: string }).id
   await logAudit({
     orgId: caller.org_id as string,
     actorId: session.user.id,
     action: "DEPARTMENT_CREATED",
     targetType: "department",
-    targetId: deptId,
+    targetId: deptId as string,
     metadata: { name: parsed.data.name },
   })
 
-  // Owners and Admins never belong to a department, even as manager
-  if (manager && manager.role !== "Owner" && manager.role !== "Admin") {
-    await supabase.from("org_members").update({ department_id: deptId }).eq("id", manager.id)
+  if (moveManager) {
+    const mgr = manager as NonNullable<typeof manager>
     await logAudit({
       orgId: caller.org_id as string,
       actorId: session.user.id,
       action: "MEMBER_UPDATED",
       targetType: "org_member",
-      targetId: manager.id,
+      targetId: mgr.id,
       metadata: {
         targetUserId: parsed.data.managerId,
-        changes: { department: { from: manager.department_id, to: deptId } },
+        changes: { department: { from: mgr.department_id, to: deptId } },
       },
     })
   }
