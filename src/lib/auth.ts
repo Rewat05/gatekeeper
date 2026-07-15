@@ -13,7 +13,22 @@ const mailer = nodemailer.createTransport({
     user: process.env.GMAIL_USER,
     pass: process.env.GMAIL_APP_PASSWORD,
   },
+  // Serverless functions get killed at their execution limit; without these,
+  // a stalled SMTP handshake hangs silently instead of failing with a log.
+  connectionTimeout: 10_000,
+  greetingTimeout: 10_000,
+  socketTimeout: 10_000,
 })
+
+async function sendMail(options: Parameters<typeof mailer.sendMail>[0]) {
+  try {
+    const info = await mailer.sendMail(options)
+    console.log("[mailer] sent:", { to: options.to, messageId: info.messageId, response: info.response })
+  } catch (err) {
+    console.error("[mailer] failed:", { to: options.to }, err)
+    throw err
+  }
+}
 
 export const auth = betterAuth({
   database: new PostgresDialect({
@@ -24,7 +39,7 @@ export const auth = betterAuth({
     enabled: true,
     requireEmailVerification: true,
     sendResetPassword: async ({ user, url }) => {
-      await mailer.sendMail({
+      await sendMail({
         from: `Gatekeeper <${process.env.GMAIL_USER}>`,
         to: user.email,
         subject: "Reset your Gatekeeper password",
@@ -42,7 +57,7 @@ export const auth = betterAuth({
     sendOnSignUp: true,
     autoSignInAfterVerification: true,
     sendVerificationEmail: async ({ user, url }) => {
-      await mailer.sendMail({
+      await sendMail({
         from: `Gatekeeper <${process.env.GMAIL_USER}>`,
         to: user.email,
         subject: "Verify your Gatekeeper account",
