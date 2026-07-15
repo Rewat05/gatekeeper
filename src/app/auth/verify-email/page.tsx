@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { Suspense, useState } from "react"
 import { useSearchParams } from "next/navigation"
 import { sendVerificationEmail } from "@/lib/auth-client"
 import { Button } from "@/components/ui/button"
@@ -10,6 +10,14 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { AuthPageShell } from "@/components/auth-page-shell"
 
 export default function VerifyEmailPage() {
+  return (
+    <Suspense fallback={null}>
+      <VerifyEmailForm />
+    </Suspense>
+  )
+}
+
+function VerifyEmailForm() {
   const searchParams = useSearchParams()
   const defaultEmail = searchParams.get("email") ?? ""
 
